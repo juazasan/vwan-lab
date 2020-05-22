@@ -1,0 +1,90 @@
+# Create Resource Group and deploy branch1 network resources
+
+az group create --name rgbranch1 --location eastus
+az network vnet create --name branch1vnet --resource-group rgbranch1 --address-prefix 10.30.0.0/16 --location eastus --subnet-name branch1subnet --subnet-prefix 10.30.0.0/24
+az network vnet subnet create --address-prefix 10.30.255.0/27 --name RouterSubnet --resource-group rgbranch1 --vnet-name branch1vnet
+az network public-ip create --name branch1GWIP1 --resource-group rgbranch1 --allocation-method Dynamic
+branch1GWIP1="$(az network public-ip show --name branch1GWIP1 --resource-group rgbranch1 --query ipAddress -o tsv)"
+
+# Deploy branch1 Router and configure default routes
+branch1gwsubnetid="$(az network vnet subnet show --name RouterSubnet --vnet-name branch1vnet --resource-group rgbranch1 --query id -o tsv)"
+az vm image terms accept --urn cisco:cisco-csr-1000v:16_9-byol:16.9.120180924
+az vm create \
+  --size Standard_D2_v2 \
+  --os-disk-size-gb 32 \
+  --storage-sku Standard_LRS \
+  --resource-group rgbranch1 \
+  --name branch1gw \
+  --image cisco:cisco-csr-1000v:16_9-byol:16.9.120180924 \
+  --admin-username branch1gw \
+  --generate-ssh-keys \
+  --subnet $branch1gwsubnetid \
+  --private-ip-address 10.30.255.4 \
+  --public-ip-address branch1GWIP1 \
+  --public-ip-address-allocation dynamic \
+  --public-ip-address-dns-name branch1csr
+
+az network nic update --resource-group rgbranch1 --name branch1gwVMNic --ip-forwarding true
+
+az network route-table create \
+  --name branch1-rt-table \
+  --resource-group rgbranch1 \
+  --location eastus \
+  --disable-bgp-route-propagation true
+az network route-table route create \
+--resource-group rgbranch1 \
+--name Default-Route \
+--route-table-name branch1-rt-table \
+--address-prefix 10.0.0.0/8 \
+--next-hop-type VirtualAppliance \
+--next-hop-ip-address 10.30.255.4
+az network vnet subnet update \
+-n branch1subnet \
+-g rgbranch1 \
+--vnet-name branch1vnet \
+--address-prefixes 10.30.0.0/24 \
+--route-table branch1-rt-table
+
+# Create the sites in Azure vWAN
+az network vpn-site create --ip-address $branch1GWIP1 --name sitetobranch1 --resource-group rgvwan --bgp-peering-address 10.30.255.4 --device-model VPNGateway --device-vendor Cisco --virtual-wan vwanlab --asn 65101
+
+# Link Branch1 Site to both Hubs
+
+az network vpn-gateway connection create -n branch1 --gateway-name vwanhubWEgw -g rgvwan --remote-vpn-site sitetobranch1 --enable-bgp true --protocol-type IKEv2 --shared-key "$PASSWORD"
+az network vpn-gateway connection create -n branch1 --gateway-name vwanhubNEgw -g rgvwan --remote-vpn-site sitetobranch1 --enable-bgp true --protocol-type IKEv2 --shared-key "$PASSWORD"
+
+# Configure Cisco CSR
+# 1: Update ciscocsrbranch1.cfg with the settings from your vWAN Hubs
+# WEHUB_PIP1
+# WEHUB_PIP2
+# NEHUB_PIP1
+# NEHUB_PIP2
+# PASSWORD
+# 2: Connect to the Cisco CSR and apply the configuration. Remember saving it
+# 3: Check whether the connection is up
+show crypto ike sa
+# 4: Check BGP peering is working
+sh ip bgp summ
+sh ip bgp
+
+# Deploy test VM
+branch1subnetid="$(az network vnet subnet show --name branch1subnet --vnet-name branch1vnet --resource-group rgbranch1 --query id -o tsv)"
+az vm create \
+  --size Standard_B1MS \
+  --os-disk-size-gb 32 \
+  --storage-sku Standard_LRS \
+  --resource-group rgbranch1 \
+  --name branch1vm \
+  --image UbuntuLTS \
+  --admin-username branch1vm \
+  --generate-ssh-keys \
+  --subnet $branch1subnetid \
+  --public-ip-address branch1vmpip \
+  --public-ip-address-allocation dynamic \
+  --public-ip-address-dns-name branch1vm
+
+# Delete branch1
+az network vpn-gateway connection delete --name Connection-sitetobranch1 --gateway-name vwanhubWEgw -g rgvwan
+az network vpn-gateway connection delete --name Connection-sitetobranch1 --gateway-name vwanhubNEgw -g rgvwan
+az network vpn-site delete --name sitetobranch1 --resource-group rgvwan
+az group delete --name rgbranch1 -y --no-wait

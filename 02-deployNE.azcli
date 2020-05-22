@@ -1,0 +1,167 @@
+# Create NE networks
+az group create --name rgnenetworks --location "North Europe"
+az network vnet create --name nehubvnet --resource-group rgnenetworks --address-prefix 10.20.0.0/16 --location northeurope --subnet-name AzureFirewallSubnet --subnet-prefix 10.20.1.0/26
+az network vnet subnet create --address-prefix 10.20.2.0/24 --name sharedServices --resource-group rgnenetworks --vnet-name nehubvnet
+az network vnet create --name nespokevnet1 --resource-group rgnenetworks --address-prefix 10.21.0.0/16 --location northeurope --subnet-name spoke1subnet --subnet-prefix 10.21.1.0/24
+az network vnet create --name nespokevnet2 --resource-group rgnenetworks --address-prefix 10.22.0.0/16 --location northeurope --subnet-name spoke2subnet --subnet-prefix 10.22.1.0/24
+az network vnet peering create --name nehubtospoke1 --remote-vnet nespokevnet1 --resource-group rgnenetworks --vnet-name nehubvnet --allow-vnet-access
+az network vnet peering create --name wespoke1tohub --remote-vnet nehubvnet --resource-group rgnenetworks --vnet-name nespokevnet1 --allow-forwarded-traffic --allow-vnet-access
+az network vnet peering create --name nehubtospoke2 --remote-vnet nespokevnet2 --resource-group rgnenetworks --vnet-name nehubvnet --allow-vnet-access
+az network vnet peering create --name wespoke2tohub --remote-vnet nehubvnet --resource-group rgnenetworks --vnet-name nespokevnet2 --allow-forwarded-traffic --allow-vnet-access
+
+# Deploy the Az Firewall and configure network routing
+
+az network firewall create \
+    --name neazfirewall \
+    --resource-group rgnenetworks \
+    --location northeurope
+az network public-ip create \
+    --name neazfirewallpip \
+    --resource-group rgnenetworks \
+    --location northeurope \
+    --allocation-method static \
+    --sku standard
+az network firewall ip-config create \
+    --firewall-name neazfirewall \
+    --name FW-config \
+    --public-ip-address neazfirewallpip \
+    --resource-group rgnenetworks \
+    --vnet-name nehubvnet
+az network firewall update \
+    --name neazfirewall \
+    --resource-group rgnenetworks 
+az network public-ip show \
+    --name neazfirewallpip \
+    --resource-group rgnenetworks
+neazfwprivaddr="$(az network firewall ip-config list -g rgnenetworks -f neazfirewall --query "[?name=='FW-config'].privateIpAddress" --output tsv)"
+
+az network route-table create \
+    --name neazfirewall-rt-table \
+    --resource-group rgnenetworks \
+    --location northeurope \
+    --disable-bgp-route-propagation true
+az network route-table route create \
+  --resource-group rgnenetworks \
+  --name DG-Route \
+  --route-table-name neazfirewall-rt-table \
+  --address-prefix 0.0.0.0/0 \
+  --next-hop-type VirtualAppliance \
+  --next-hop-ip-address $neazfwprivaddr
+az network vnet subnet update \
+-n spoke1subnet \
+-g rgnenetworks \
+--vnet-name nespokevnet1 \
+--address-prefixes 10.11.1.0/24 \
+--route-table neazfirewall-rt-table
+az network vnet subnet update \
+-n spoke2subnet \
+-g rgnenetworks \
+--vnet-name nespokevnet2 \
+--address-prefixes 10.12.1.0/24 \
+--route-table neazfirewall-rt-table
+az network firewall network-rule create \
+   --collection-name DefaultRules \
+   --destination-addresses 10.0.0.0/8 \
+   --destination-ports 1-65535 \
+   --firewall-name neazfirewall \
+   --name Allow-Internal-Traffic \
+   --protocols Any \
+   --resource-group rgnenetworks \
+   --priority 200 \
+   --source-addresses 10.0.0.0/8 \
+   --action Allow
+az network firewall network-rule create \
+   --collection-name InternetRules \
+   --destination-addresses * \
+   --destination-ports 1-65535 \
+   --firewall-name neazfirewall \
+   --name Allow-Internet-Traffic \
+   --protocols Any \
+   --resource-group rgwenetworks \
+   --priority 201 \
+   --source-addresses 10.0.0.0/8 \
+   --action Allow    
+
+# Start and stop of an existing Azure Firewall
+# https://docs.microsoft.com/en-us/azure/firewall/firewall-faq#how-can-i-stop-and-start-azure-firewall
+
+# Stop
+$azfw = Get-AzFirewall -Name "neazfirewall" -ResourceGroupName "rgnenetworks"
+$azfw.Deallocate()
+Set-AzFirewall -AzureFirewall $azfw
+
+# Start
+$azfw = Get-AzFirewall -Name "neazfirewall" -ResourceGroupName "rgnenetworks"
+$vnet = Get-AzVirtualNetwork -ResourceGroupName "rgnenetworks" -Name "nehubvnet"
+$publicip = Get-AzPublicIpAddress -Name "neazfirewallpip" -ResourceGroupName "rgnenetworks"
+$azfw.Allocate($vnet,$publicip)
+Set-AzFirewall -AzureFirewall $azfw
+
+# Create vWAN Hub
+az network vhub create --address-prefix 192.168.2.0/24 --name vwanhubNE --resource-group rgvwan --vwan vwanlab --location "North Europe"
+az network vpn-gateway create --name vwanhubNEgw --resource-group rgvwan --vhub vwanhubNE --peer-weight 10 --scale-unit 1 --no-wait --location "North Europe"
+az network vhub connection create --name nevwanhubtohub \
+                                  --remote-vnet /subscriptions/$SUBSCRIPTIONID/resourceGroups/rgnenetworks/providers/Microsoft.Network/virtualNetworks/nehubvnet \
+                                  --resource-group rgvwan \
+                                  --vhub-name vwanhubNE \
+                                  --internet-security false \
+                                  --remote-vnet-transit true \
+                                  --use-hub-vnet-gateways true
+az network vhub connection create --name nevwanhubtospoke1 \
+                                  --remote-vnet /subscriptions/$SUBSCRIPTIONID/resourceGroups/rgnenetworks/providers/Microsoft.Network/virtualNetworks/nespokevnet1 \
+                                  --resource-group rgvwan \
+                                  --vhub-name vwanhubNE \
+                                  --internet-security false \
+                                  --remote-vnet-transit true \
+                                  --use-hub-vnet-gateways true
+az network vhub connection create --name nevwanhubtospoke2 \
+                                  --remote-vnet /subscriptions/$SUBSCRIPTIONID/resourceGroups/rgnenetworks/providers/Microsoft.Network/virtualNetworks/nespokevnet2 \
+                                  --resource-group rgvwan \
+                                  --vhub-name vwanhubNE \
+                                  --internet-security false \
+                                  --remote-vnet-transit true \
+                                  --use-hub-vnet-gateways true
+
+
+az network vhub route add --address-prefixes 10.20.0.0/16 10.21.0.0/16 10.22.0.0/16 --next-hop $neazfwprivaddr --resource-group rgvwan --vhub-name vwanhubNE
+
+az network vhub connection delete --name nevwanhubtohub --resource-group rgvwan --vhub-name vwanhubNE
+az network vhub connection delete --name nevwanhubtospoke1 --resource-group rgvwan --vhub-name vwanhubNE
+az network vhub connection delete --name nevwanhubtospoke2 --resource-group rgvwan --vhub-name vwanhubNE
+
+az network vhub route-table create --connections All_Branches \
+                                   --destination-type CIDR \
+                                   --destinations 10.10.0.0/16 10.11.0.0/16 10.12.0.0/16 \
+                                   --name branchestoHubVnetRouteTable \
+                                   --next-hop-type IPAddress \
+                                   --next-hops $neazfwprivaddr \
+                                   --resource-group rgvwan \
+                                   --vhub-name vwanhubNE
+
+# Deploy test VM in WE
+
+spoke1subnetid="$(az network vnet subnet show --name spoke1subnet --vnet-name nespokevnet1 --resource-group rgnenetworks --query id -o tsv)"
+az group create --name weapp1 --location "West Europe"
+az vm create \
+  --size Standard_B1MS \
+  --os-disk-size-gb 32 \
+  --storage-sku Standard_LRS \
+  --resource-group neapp1 \
+  --name nespoke1vm \
+  --image UbuntuLTS \
+  --admin-username nespoke1vm \
+  --generate-ssh-keys \
+  --subnet $spoke1subnetid \
+  --private-ip-address 10.21.1.10 \
+  --public-ip-address nespoke1vmpip \
+  --public-ip-address-allocation dynamic \
+  --public-ip-address-dns-name nespoke1vm
+
+
+# Delete vWAN Hub in NE
+az network vpn-gateway delete --name vwanhubNEgw --resource-group rgvwan
+az network vhub delete --resource-group rgvwan --name vwanhubNE
+az group delete --name neapp1 -y --no-wait
+az group delete --name rgnenetworks -y --no-wait
+
+

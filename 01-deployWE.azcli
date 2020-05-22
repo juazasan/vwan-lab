@@ -1,0 +1,237 @@
+# Install azure cli extensions
+
+az extension add --name virtual-wan
+az extension add --name azure-firewall
+
+# Create WE networks
+az group create --name rgwenetworks --location "West Europe"
+az network vnet create --name wehubvnet --resource-group rgwenetworks --address-prefix 10.10.0.0/16 --location westeurope --subnet-name AzureFirewallSubnet --subnet-prefix 10.10.1.0/26
+az network vnet subnet create --address-prefix 10.10.2.0/24 --name sharedServices --resource-group rgwenetworks --vnet-name wehubvnet
+az network vnet create --name wespokevnet1 --resource-group rgwenetworks --address-prefix 10.11.0.0/16 --location westeurope --subnet-name spoke1subnet --subnet-prefix 10.11.1.0/24
+az network vnet create --name wespokevnet2 --resource-group rgwenetworks --address-prefix 10.12.0.0/16 --location westeurope --subnet-name spoke2subnet --subnet-prefix 10.12.1.0/24
+az network vnet peering create --name wehubtospoke1 --remote-vnet wespokevnet1 --resource-group rgwenetworks --vnet-name wehubvnet --allow-vnet-access
+az network vnet peering create --name wespoke1tohub --remote-vnet wehubvnet --resource-group rgwenetworks --vnet-name wespokevnet1 --allow-forwarded-traffic --allow-vnet-access
+az network vnet peering create --name wehubtospoke2 --remote-vnet wespokevnet2 --resource-group rgwenetworks --vnet-name wehubvnet --allow-vnet-access
+az network vnet peering create --name wespoke2tohub --remote-vnet wehubvnet --resource-group rgwenetworks --vnet-name wespokevnet2 --allow-forwarded-traffic --allow-vnet-access
+
+# Deploy the Az Firewall and configure network routing
+
+az network firewall create \
+    --name weazfirewall \
+    --resource-group rgwenetworks \
+    --location westeurope
+az network public-ip create \
+    --name weazfirewallpip \
+    --resource-group rgwenetworks \
+    --location westeurope \
+    --allocation-method static \
+    --sku standard
+az network firewall ip-config create \
+    --firewall-name weazfirewall \
+    --name FW-config \
+    --public-ip-address weazfirewallpip \
+    --resource-group rgwenetworks \
+    --vnet-name wehubvnet
+az network firewall update \
+    --name weazfirewall \
+    --resource-group rgwenetworks 
+az network public-ip show \
+    --name weazfirewallpip \
+    --resource-group rgwenetworks
+weazfwprivaddr="$(az network firewall ip-config list -g rgwenetworks -f weazfirewall --query "[?name=='AzureFirewallIpConfiguration0'].privateIpAddress" --output tsv)"
+
+az network route-table create \
+    --name weazfirewall-rt-table \
+    --resource-group rgwenetworks \
+    --location westeurope \
+    --disable-bgp-route-propagation true
+az network route-table route create \
+  --resource-group rgwenetworks \
+  --name DG-Route \
+  --route-table-name weazfirewall-rt-table \
+  --address-prefix 0.0.0.0/0 \
+  --next-hop-type VirtualAppliance \
+  --next-hop-ip-address $weazfwprivaddr
+az network vnet subnet update \
+-n spoke1subnet \
+-g rgwenetworks \
+--vnet-name wespokevnet1 \
+--address-prefixes 10.11.1.0/24 \
+--route-table weazfirewall-rt-table
+az network vnet subnet update \
+-n spoke2subnet \
+-g rgwenetworks \
+--vnet-name wespokevnet2 \
+--address-prefixes 10.12.1.0/24 \
+--route-table weazfirewall-rt-table
+
+az network route-table create \
+    --name weazfirewall-rt-table-hub \
+    --resource-group rgwenetworks \
+    --location westeurope \
+    --disable-bgp-route-propagation true
+az network route-table route create \
+  --resource-group rgwenetworks \
+  --name DG-Route \
+  --route-table-name weazfirewall-rt-table-hub \
+  --address-prefix 0.0.0.0/0 \
+  --next-hop-type VirtualAppliance \
+  --next-hop-ip-address $weazfwprivaddr
+az network route-table route create \
+  --resource-group rgwenetworks \
+  --name spoke1 \
+  --route-table-name weazfirewall-rt-table-hub \
+  --address-prefix 10.11.0.0/16 \
+  --next-hop-type VirtualAppliance \
+  --next-hop-ip-address $weazfwprivaddr
+az network route-table route create \
+  --resource-group rgwenetworks \
+  --name spoke2 \
+  --route-table-name weazfirewall-rt-table-hub \
+  --address-prefix 10.12.0.0/16 \
+  --next-hop-type VirtualAppliance \
+  --next-hop-ip-address $weazfwprivaddr
+az network vnet subnet update \
+-n sharedServices \
+-g rgwenetworks \
+--vnet-name wehubvnet \
+--address-prefixes 10.10.2.0/24 \
+--route-table weazfirewall-rt-table-hub
+
+az network firewall network-rule create \
+   --collection-name DefaultRules \
+   --destination-addresses 10.0.0.0/8 \
+   --destination-ports 1-65535 \
+   --firewall-name weazfirewall \
+   --name Allow-Internal-Traffic \
+   --protocols Any \
+   --resource-group rgwenetworks \
+   --priority 200 \
+   --source-addresses 10.0.0.0/8 \
+   --action Allow
+az network firewall network-rule create \
+   --collection-name InternetRules \
+   --destination-addresses * \
+   --destination-ports 1-65535 \
+   --firewall-name weazfirewall \
+   --name Allow-Internet-Traffic \
+   --protocols Any \
+   --resource-group rgwenetworks \
+   --priority 201 \
+   --source-addresses 10.0.0.0/8 \
+   --action Allow   
+
+# Start and stop of an existing Azure Firewall
+# https://docs.microsoft.com/en-us/azure/firewall/firewall-faq#how-can-i-stop-and-start-azure-firewall
+
+# Stop
+$azfw = Get-AzFirewall -Name "weazfirewall" -ResourceGroupName "rgwenetworks"
+$azfw.Deallocate()
+Set-AzFirewall -AzureFirewall $azfw
+
+# Start
+$azfw = Get-AzFirewall -Name "weazfirewall" -ResourceGroupName "rgwenetworks"
+$vnet = Get-AzVirtualNetwork -ResourceGroupName "rgwenetworks" -Name "wehubvnet"
+$publicip = Get-AzPublicIpAddress -Name "weazfirewallpip" -ResourceGroupName "rgwenetworks"
+$azfw.Allocate($vnet,$publicip)
+Set-AzFirewall -AzureFirewall $azfw
+
+# Create vWAN resource
+az group create --name rgvwan --location "West Europe"
+az network vwan create --name vwanlab -g rgvwan
+
+# Create vWAN Hub
+SUBSCRIPTIONID=$(az account show --query id -o tsv)
+az network vhub create --address-prefix 192.168.1.0/24 --name vwanhubWE --resource-group rgvwan --vwan vwanlab --location "West Europe"
+az network vpn-gateway create --name vwanhubWEgw --resource-group rgvwan --vhub vwanhubWE --peer-weight 10 --scale-unit 1 --no-wait --location "West Europe"
+
+
+# Connect Virtual Networks
+az network vhub connection create --name wevwanhubtohub \
+                                  --remote-vnet /subscriptions/$SUBSCRIPTIONID/resourceGroups/rgwenetworks/providers/Microsoft.Network/virtualNetworks/wehubvnet \
+                                  --resource-group rgvwan \
+                                  --vhub-name vwanhubWE \
+                                  --internet-security false \
+                                  --remote-vnet-transit true \
+                                  --use-hub-vnet-gateways true
+az network vhub connection create --name wevwanhubtospoke1 \
+                                  --remote-vnet /subscriptions/$SUBSCRIPTIONID/resourceGroups/rgwenetworks/providers/Microsoft.Network/virtualNetworks/wespokevnet1 \
+                                  --resource-group rgvwan \
+                                  --vhub-name vwanhubWE \
+                                  --internet-security false \
+                                  --remote-vnet-transit true \
+                                  --use-hub-vnet-gateways true
+az network vhub connection create --name wevwanhubtospoke2 \
+                                  --remote-vnet /subscriptions/$SUBSCRIPTIONID/resourceGroups/rgwenetworks/providers/Microsoft.Network/virtualNetworks/wespokevnet2 \
+                                  --resource-group rgvwan \
+                                  --vhub-name vwanhubWE \
+                                  --internet-security false \
+                                  --remote-vnet-transit true \
+                                  --use-hub-vnet-gateways true
+
+# Add routes to Virtual Networks
+
+az network vhub route add --address-prefixes 10.10.0.0/16 10.11.0.0/16 10.12.0.0/16 --next-hop $weazfwprivaddr --resource-group rgvwan --vhub-name vwanhubWE
+
+az network vhub route list --resource-group rgvwan --vhub-name vwanhubWE
+
+# Deploy test VMs in WE
+
+az group create --name weapp1 --location "West Europe"
+
+hubsubnetid="$(az network vnet subnet show --name sharedServices --vnet-name wehubvnet --resource-group rgwenetworks --query id -o tsv)"
+az vm create \
+  --size Standard_B1MS \
+  --os-disk-size-gb 32 \
+  --storage-sku Standard_LRS \
+  --resource-group weapp1 \
+  --name wehubvm \
+  --image UbuntuLTS \
+  --admin-username wehubvm \
+  --generate-ssh-keys \
+  --subnet $hubsubnetid \
+  --private-ip-address 10.10.2.10 \
+  --nsg "" \
+  --public-ip-address ""
+
+spoke1subnetid="$(az network vnet subnet show --name spoke1subnet --vnet-name wespokevnet1 --resource-group rgwenetworks --query id -o tsv)"
+az vm create \
+  --size Standard_B1MS \
+  --os-disk-size-gb 32 \
+  --storage-sku Standard_LRS \
+  --resource-group weapp1 \
+  --name wespoke1vm \
+  --image UbuntuLTS \
+  --admin-username wespoke1vm \
+  --generate-ssh-keys \
+  --subnet $spoke1subnetid \
+  --private-ip-address 10.11.1.10 \
+  --nsg "" \
+  --public-ip-address ""
+
+spoke2subnetid="$(az network vnet subnet show --name spoke2subnet --vnet-name wespokevnet2 --resource-group rgwenetworks --query id -o tsv)"
+az vm create \
+  --size Standard_B1MS \
+  --os-disk-size-gb 32 \
+  --storage-sku Standard_LRS \
+  --resource-group weapp1 \
+  --name wespoke2vm \
+  --image UbuntuLTS \
+  --admin-username wespoke2vm \
+  --generate-ssh-keys \
+  --subnet $spoke2subnetid \
+  --private-ip-address 10.12.1.10 \
+  --nsg "" \
+  --public-ip-address ""
+
+# Delete vWAN Hub in WE
+
+az group delete --name weapp1 -y --no-wait
+az network vpn-gateway delete --name vwanhubWEgw --resource-group rgvwan
+az network vhub connection delete --name wevwanhubtohub --resource-group rgvwan --vhub-name vwanhubWE
+az network vhub connection delete --name wevwanhubtospoke1 --resource-group rgvwan --vhub-name vwanhubWE
+az network vhub connection delete --name wevwanhubtospoke2 --resource-group rgvwan --vhub-name vwanhubWE
+az network vhub delete --resource-group rgvwan --name vwanhubWE
+az network vwan delete --name vwanlab -g rgvwan
+az group delete --name rgvwan -y --no-wait
+az group delete --name rgwenetworks -y --no-wait
